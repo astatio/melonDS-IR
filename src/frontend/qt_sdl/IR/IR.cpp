@@ -2,6 +2,7 @@
 #include <QTcpServer>
 #include <QTcpSocket>
 #include <QtSerialPort/QSerialPort>
+#include <QDateTime>
 
 
 
@@ -80,53 +81,193 @@ u8 IR_TCP_RecievePacket(char* data, int len, void * userdata){
 
 //--------------------SERIAL = 1
 QSerialPort *serial = nullptr;
+
+bool IR_IsSerialHealthy(){
+    if (!serial || !serial->isOpen()) {
+        return false;
+    }
+
+    // Check for serial port errors that indicate disconnection
+    QSerialPort::SerialPortError error = serial->error();
+    if (error == QSerialPort::ResourceError ||
+        error == QSerialPort::PermissionError ||
+        error == QSerialPort::DeviceNotFoundError) {
+        return false;
+    }
+
+    return true;
+}
+
+void IR_CloseSerialPort(){
+    if (serial) {
+        if (serial->isOpen()) {
+            serial->close();
+            FILE* log = fopen("ir_serial.log", "a");
+            if (log) {
+                fprintf(log, "Serial port closed\n");
+                fflush(log);
+                fclose(log);
+            }
+            printf("Serial port closed\n");
+        }
+        delete serial;
+        serial = nullptr;
+    }
+}
+
 void IR_OpenSerialPort(void * userdata){
+    if (!IR_IsSerialHealthy()) {
+        IR_CloseSerialPort();
+    }
+
     if (!serial){
 
         EmuInstance* inst = (EmuInstance*)userdata;
         auto& cfg = inst->getLocalConfig();
 
         serial = new QSerialPort();
-        serial->setPortName(cfg.GetQString("IR.SerialPortPath"));
-        serial->setBaudRate(QSerialPort::Baud115200);
-        serial->setDataBits(QSerialPort::Data8);
-        serial->setParity(QSerialPort::NoParity);
-        serial->setStopBits(QSerialPort::OneStop);
-        serial->setFlowControl(QSerialPort::NoFlowControl);
-        if (!serial->open(QIODevice::ReadWrite)) {
-            printf("Failed to open serial port %s\n", serial->errorString().toUtf8().constData());
+
+        QString portPath = cfg.GetQString("IR.SerialPortPath");
+
+        // Windows: COM ports above COM9 need \\.\COMxx format
+        #ifdef _WIN32
+        if (portPath.startsWith("COM", Qt::CaseInsensitive)) {
+            int portNum = portPath.mid(3).toInt();
+            if (portNum > 9) {
+                portPath = "\\\\.\\" + portPath;
+            }
         }
-        else printf("Serial port open:\n");
+        #endif
+
+        serial->setPortName(portPath);
+
+        // Log to file for debugging
+        FILE* log = fopen("ir_serial.log", "a");
+        if (log) {
+            fprintf(log, "Attempting to open serial port: %s\n", portPath.toUtf8().constData());
+            fflush(log);
+        }
+
+        if (!serial->open(QIODevice::ReadWrite)) {
+            QString error = QString("Failed to open serial port %1: %2\n").arg(portPath).arg(serial->errorString());
+            printf("%s", error.toUtf8().constData());
+            if (log) {
+                fprintf(log, "%s", error.toUtf8().constData());
+                fflush(log);
+            }
+        }
+        else {
+            // Configure port settings AFTER opening
+            serial->setBaudRate(QSerialPort::Baud115200);
+            serial->setDataBits(QSerialPort::Data8);
+            serial->setParity(QSerialPort::NoParity);
+            serial->setStopBits(QSerialPort::OneStop);
+            serial->setFlowControl(QSerialPort::NoFlowControl);
+
+            // Explicitly set DTR and RTS high for device stability
+            serial->setDataTerminalReady(true);
+            // serial->setRequestToSend(true);
+
+            // Clear any stale data in buffers
+            serial->clear();
+
+            QString success = QString("Serial port opened successfully: %1 (115200 8N1, DTR=1, RTS=1)\n").arg(portPath);
+            printf("%s", success.toUtf8().constData());
+            if (log) {
+                fprintf(log, "%s", success.toUtf8().constData());
+                fflush(log);
+            }
+        }
+
+        if (log) fclose(log);
     }
     else return;
 }
 u8 IR_Serial_SendPacket(char* data, int len, void * userdata){
     IR_OpenSerialPort(userdata);
     QCoreApplication::processEvents(); // allow Qt to update I/O status
+
+    FILE* log = fopen("ir_serial.log", "a");
+
     if (!serial || !serial->isOpen()) {
         printf("Serial write failed: port not open\n");
+        if (log) {
+            fprintf(log, "Serial write failed: port not open\n");
+            fclose(log);
+        }
         return 0;
     }
-    qint64 written = serial->write(data, len);
-    serial->flush();
-    printf("Serial wrote %lld bytes\n", written);
-    return static_cast<u8>(written);
 
+    qint64 written = serial->write(data, len);
+
+    if (written < 0) {
+        QString error = QString("Serial write error: %1\n").arg(serial->errorString());
+        printf("%s", error.toUtf8().constData());
+        if (log) {
+            fprintf(log, "%s", error.toUtf8().constData());
+            fclose(log);
+        }
+        return 0;
+    }
+
+    serial->flush();
+
+    printf("Serial wrote %lld bytes: ", written);
+    for (int i = 0; i < len; ++i)
+        printf("%02X ", static_cast<unsigned char>(data[i]));
+    printf("\n");
+
+    if (log) {
+        fprintf(log, "Serial wrote %lld bytes: ", written);
+        for (int i = 0; i < len; ++i)
+            fprintf(log, "%02X ", static_cast<unsigned char>(data[i]));
+        fprintf(log, "\n");
+        fflush(log);
+        fclose(log);
+    }
+
+    return static_cast<u8>(written);
 }
 u8 IR_Serial_RecievePacket(char* data, int len,void * userdata){
     IR_OpenSerialPort(userdata);
     QCoreApplication::processEvents(); // allow Qt to update I/O status
+
     if (!serial || !serial->isOpen() || !serial->bytesAvailable()) {
         return 0;
     }
+
+    FILE* log = fopen("ir_serial.log", "a");
     qint64 bytesRead = serial->read(data, len);
+
+    if (bytesRead < 0) {
+        QString error = QString("Serial read error: %1\n").arg(serial->errorString());
+        printf("%s", error.toUtf8().constData());
+        if (log) {
+            fprintf(log, "%s", error.toUtf8().constData());
+            fclose(log);
+        }
+        return 0;
+    }
+
     if (bytesRead > 0) {
         printf("Serial Read %lld bytes: ", bytesRead);
         for (int i = 0; i < bytesRead; ++i)
             printf("%02X ", static_cast<unsigned char>(data[i]));
         printf("\n");
+
+        if (log) {
+            fprintf(log, "Serial Read %lld bytes: ", bytesRead);
+            for (int i = 0; i < bytesRead; ++i)
+                fprintf(log, "%02X ", static_cast<unsigned char>(data[i]));
+            fprintf(log, "\n");
+            fflush(log);
+            fclose(log);
+        }
+
         return static_cast<u8>(bytesRead);
     }
+
+    if (log) fclose(log);
     return 0;
 }
 
@@ -245,12 +386,22 @@ u8 IR_Direct_RecievePacket(char* data, int len,void * userdata){
 
 
 //--------------------------------Global
+static int lastIRMode = -1; // Track previous mode
+
 u8 IR_SendPacket(char* data, int len, void * userdata){
     EmuInstance* inst = (EmuInstance*)userdata;
     auto& cfg = inst->getLocalConfig();
 
-
     int IRMode = cfg.GetInt("IR.Mode");
+
+    // Cleanup when mode changes
+    if (IRMode != lastIRMode) {
+        if (lastIRMode == 1) {
+            IR_CloseSerialPort();
+        }
+    }
+    lastIRMode = IRMode;
+
     //printf("Trying to send IR Packet in mode: %d\n", IRMode);
 
     if (IRMode == 0) return 0;
@@ -264,6 +415,15 @@ u8 IR_RecievePacket(char* data, int len, void * userdata){
     auto& cfg = inst->getLocalConfig();
 
     int IRMode = cfg.GetInt("IR.Mode");
+
+    // Cleanup when mode changes
+    if (IRMode != lastIRMode) {
+        if (lastIRMode == 1) {
+            IR_CloseSerialPort();
+        }
+    }
+    lastIRMode = IRMode;
+
     //printf("Trying to recieve IR Packet in mode: %d\n", IRMode);
 
     if (IRMode == 0) return 0;
