@@ -1,3 +1,6 @@
+
+The MelonDS-IR merged with the updated melonDS upstream, basically that.
+
 <p align="center"><img src="https://raw.githubusercontent.com/melonDS-emu/melonDS/master/res/icon/melon_128x128.png"></p>
 <h2 align="center"><b>melonDS</b></h2>
 <p align="center">
